@@ -12,18 +12,36 @@ Télécharge l'audio d'une vidéo **YouTube, SoundCloud, ou tout site supporté 
 | `ffmpeg` | Intégration de la pochette et des tags ID3 |
 | `ImageMagick` | Recadrage de la miniature en carré |
 
-### Installation sur Fedora
+### Fedora
 
 ```bash
-# Activer RPM Fusion si ffmpeg n'est pas disponible
+# Activer RPM Fusion (nécessaire pour ffmpeg)
 sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
 sudo dnf install https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
 
-# Installer les dépendances
-sudo dnf install ffmpeg ImageMagick
+sudo dnf install ffmpeg ImageMagick yt-dlp
 ```
 
-> `yt-dlp` déjà installé ✅
+### Debian / Ubuntu
+
+```bash
+sudo apt install ffmpeg imagemagick
+
+# yt-dlp : la version apt est souvent obsolète, préférer pipx
+sudo apt install pipx && pipx install yt-dlp
+```
+
+### Arch Linux
+
+```bash
+sudo pacman -S ffmpeg imagemagick yt-dlp
+```
+
+### macOS (Homebrew)
+
+```bash
+brew install ffmpeg imagemagick yt-dlp
+```
 
 ---
 
