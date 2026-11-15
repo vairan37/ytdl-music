@@ -21,10 +21,16 @@ check_deps() {
 }
 
 usage() {
-  echo -e "${CYAN}Usage :${NC} ytdl-music [--split | --no-split] <URL_YouTube>"
+  echo -e "${CYAN}Usage :${NC} ytdl-music [--split | --no-split | --tracklist FICHIER] [--comments N|all] \"<URL_YouTube>\""
   echo ""
-  echo "  --split      Découpe en pistes sans demander (chapitres ou tracklist de la description)"
-  echo "  --no-split   Ne découpe jamais : un seul fichier"
+  echo "  --split               Découpe en pistes sans demander (chapitres, description ou commentaires) ;"
+  echo "                        si rien n'est trouvé, propose de coller une tracklist"
+  echo "  --no-split            Ne découpe jamais : un seul fichier"
+  echo "  --tracklist FICHIER   Découpe selon la tracklist du fichier (une ligne « 00:00 Titre » par piste)"
+  echo "  --comments N|all      Cherche une tracklist dans les N commentaires les plus populaires"
+  echo "                        (50 par défaut, « all » = tous, peut prendre 1 à 2 min)"
+  echo ""
+  echo "  Mets l'URL entre guillemets : sinon bash coupe la commande à chaque « & »."
   exit 1
 }
 
@@ -90,13 +96,50 @@ clean_after() {
   printf '%s' "$1" | sed -E \
     -e "s/^(${SEP}|\\]|\\))+//" \
     -e 's/^[0-9]{1,3}[.)][[:space:]]+//' \
-    -e 's/[[:space:]]+$//'
+    -e 's/([[:space:]]|-|–|—|:|\||,|;|~|•)+$//'
 }
 
 # Pistes détectées (début en ms + titre)
 T_START_MS=(); T_TITLE=()
 
-# Extrait la tracklist d'une description (lignes « horodatage titre » ou « titre horodatage »)
+# Tracklist sur une seule ligne (« 0:00 A 3:12 B 6:40 C ») → une ligne par piste.
+# Seulement si la ligne commence par un horodatage ; une plage « 00:00 - 03:42 Titre » reste intacte.
+expand_inline() {
+  local line=$1 out ts pre title
+  local start_re="^[[:space:]]*(#?[0-9]{1,3}[.)][[:space:]]*)?[[(]?${TS_RE}"
+  # numérotation (« 2. ») ou crochet ouvrant en fin de segment : appartient à la piste suivante
+  local lead_re='^(.*[^[:space:]])([[:space:]]+#?[0-9]{1,3}[.)][[:space:]]*[[(]?[[:space:]]*|[[:space:]]*[[(][[:space:]]*)$'
+  if ! [[ "$line" =~ $start_re && "$line" =~ $TS_RE ]]; then
+    printf '%s\n' "$line"; return 0
+  fi
+  ts=${BASH_REMATCH[0]}
+  out=${line%%"$ts"*}$ts
+  line=${line#*"$ts"}
+  while [[ "$line" =~ $TS_RE ]]; do
+    ts=${BASH_REMATCH[0]}
+    pre=${line%%"$ts"*}
+    line=${line#*"$ts"}
+    title=$(clean_before "$(clean_after "$pre")")
+    if [[ -z "$title" ]]; then
+      out+="$pre"                                              # simple séparateur : plage
+    elif [[ "$pre" =~ $lead_re ]]; then
+      out+="${BASH_REMATCH[1]}"$'\n'"${BASH_REMATCH[2]}"         # « A [3:12] B », « A, 2. 3:12 B »
+    else
+      out+="$pre"$'\n'
+    fi
+    out+=$ts
+  done
+  printf '%s\n' "$out$line"
+}
+
+expand_lines() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    expand_inline "${line%$'\r'}"
+  done <<< "$1"
+}
+
+# Extrait la tracklist d'un texte (lignes « horodatage titre » ou « titre horodatage »)
 parse_description() {
   local line ts before after title sec
   T_START_MS=(); T_TITLE=()
@@ -127,7 +170,7 @@ parse_description() {
     [[ -z "$title" ]] && continue   # horodatage isolé, sans titre
     T_START_MS+=($(( sec * 1000 )))
     T_TITLE+=("$title")
-  done <<< "$1"
+  done < <(expand_lines "$1")
 }
 
 # Vérifie que la tracklist est exploitable (≥ 2 pistes, début proche de 0, croissante)
@@ -190,20 +233,146 @@ split_artist_title() {
   SPLIT_ARTIST=$best
 }
 
+# Un seul appel yt-dlp avec plusieurs --print ; les résultats vont dans PARTS[]
+# yt_parts [options yt-dlp…] -- <gabarit> [gabarit…]
+MARK='@@YTDL_MUSIC@@'
+yt_parts() {
+  local opts=() prints=() line cur="" first=yes
+  while [[ $# -gt 0 && "$1" != -- ]]; do opts+=("$1"); shift; done
+  shift
+  for p in "$@"; do prints+=(--print "$p" --print "$MARK"); done
+  # Lecture ligne par ligne : les substitutions bash sur une grosse sortie
+  # (des milliers de commentaires) seraient beaucoup trop lentes
+  PARTS=()
+  while IFS= read -r line; do
+    if [[ "$line" == "$MARK" ]]; then
+      PARTS+=("$cur"); cur=""; first=yes
+    elif [[ "$first" == yes ]]; then
+      cur=$line; first=no
+    else
+      cur+=$'\n'$line
+    fi
+  done < <(yt-dlp --no-playlist "${opts[@]}" "${prints[@]}" "$URL" 2>/dev/null || true)
+}
+
+# Décode une chaîne JSON (sans les guillemets) : \n \t \" \\ \/ \uXXXX, emojis compris
+json_unescape() {
+  local s=$1 out="" c hex hi lo cp
+  while [[ "$s" == *\\* ]]; do
+    out+=${s%%\\*}
+    s=${s#*\\}
+    c=${s:0:1}
+    case "$c" in
+      n) out+=$'\n'; s=${s:1} ;;
+      t) out+=$'\t'; s=${s:1} ;;
+      r|b|f) s=${s:1} ;;
+      u)
+        hex=${s:1:4}
+        if ! [[ "$hex" =~ ^[0-9a-fA-F]{4}$ ]]; then out+=u; s=${s:1}; continue; fi
+        hi=$(( 16#$hex )); s=${s:5}; cp=$hi
+        # Paire de substitution UTF-16 (emojis)
+        if (( hi >= 0xD800 && hi <= 0xDBFF )) && [[ "$s" =~ ^\\u([dD][c-fC-F][0-9a-fA-F]{2}) ]]; then
+          lo=$(( 16#${BASH_REMATCH[1]} )); s=${s:6}
+          cp=$(( 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00) ))
+        fi
+        # shellcheck disable=SC2059
+        (( cp > 0 )) && out+=$(printf "\\U$(printf '%08x' "$cp")")
+        ;;
+      *) out+=$c; s=${s:1} ;;   # \"  \\  \/
+    esac
+  done
+  printf '%s' "$out$s"
+}
+
+# Liste JSON yt-dlp (« %(…)#j » : un élément par ligne) → JSON_ITEMS[] (éléments encore échappés)
+json_lines() {
+  local line re='^[[:space:]]*"(.*)",?$'
+  JSON_ITEMS=()
+  while IFS= read -r line; do
+    [[ "$line" =~ $re ]] && JSON_ITEMS+=("${BASH_REMATCH[1]}")
+  done <<< "$1"
+}
+
+# Cherche la meilleure tracklist dans les commentaires (les plus populaires d'abord)
+# MAX_COMMENTS : nombre de commentaires lus, ou « all » pour tous (modifiable avec --comments)
+MAX_COMMENTS=50
+find_in_comments() {
+  local i raw text best_n=0 best_author="" best_start=() best_title=() texts=() authors=()
+  local two_ts='[0-9]:[0-9]{2}.*[0-9]:[0-9]{2}'
+  yt_parts --write-comments --no-write-info-json -P "$TMP" \
+    --extractor-args "youtube:max_comments=${MAX_COMMENTS},${MAX_COMMENTS},0,0" -- \
+    '%(comments.:.text)#j' '%(comments.:.author)#j'
+  COMMENTS_READ=0
+  if [[ ${#PARTS[@]} -lt 2 ]]; then
+    echo -e "${YELLOW}  Impossible de lire les commentaires (yt-dlp).${NC}"
+    T_START_MS=(); T_TITLE=()
+    return 1
+  fi
+  json_lines "${PARTS[0]}"; texts=("${JSON_ITEMS[@]}")
+  json_lines "${PARTS[1]}"; authors=("${JSON_ITEMS[@]}")
+  COMMENTS_READ=${#texts[@]}
+  for i in "${!texts[@]}"; do
+    raw=${texts[i]}
+    [[ "$raw" =~ $two_ts ]] || continue   # tri rapide : au moins 2 horodatages
+    text=$(json_unescape "$raw")
+    parse_description "$text"
+    validate_tracks || continue
+    if (( ${#T_START_MS[@]} > best_n )); then
+      best_n=${#T_START_MS[@]}; best_author=$(json_unescape "${authors[i]:-?}")
+      best_start=("${T_START_MS[@]}"); best_title=("${T_TITLE[@]}")
+    fi
+  done
+  T_START_MS=("${best_start[@]}"); T_TITLE=("${best_title[@]}")
+  if (( COMMENTS_READ == 0 )); then
+    echo -e "${YELLOW}  Aucun commentaire à lire.${NC}"
+    return 1
+  elif (( best_n == 0 )); then
+    echo -e "${YELLOW}  Aucune tracklist dans les ${COMMENTS_READ} commentaires lus.${NC}"
+    return 1
+  fi
+  COMMENT_AUTHOR=$best_author
+}
+
+# Lit une tracklist collée au clavier, jusqu'à une ligne vide
+read_pasted_tracklist() {
+  local line
+  PASTED=""
+  echo -e "${YELLOW}  Colle la tracklist (une piste par ligne : « 00:00 Titre »), puis une ligne vide :${NC}"
+  while IFS= read -r line; do
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+      [[ -n "$PASTED" ]] && break
+      continue
+    fi
+    PASTED+="$line"$'\n'
+  done
+}
+
 # ── Arguments ─────────────────────────────────────────────────────────────────
 SPLIT_MODE=ask   # ask | yes | no
 URL=""
+TRACKLIST_FILE=""
+FORCE_COMMENTS=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --split)    SPLIT_MODE=yes ;;
-    --no-split) SPLIT_MODE=no ;;
-    -h|--help)  usage ;;
-    -*)         echo -e "${RED}✗ Option inconnue : $1${NC}"; usage ;;
-    *)          URL="$1" ;;
+    --split)     SPLIT_MODE=yes ;;
+    --no-split)  SPLIT_MODE=no ;;
+    --tracklist)
+      [[ -n "${2:-}" ]] || { echo -e "${RED}✗ --tracklist attend un fichier${NC}"; usage; }
+      TRACKLIST_FILE="$2"; SPLIT_MODE=yes; shift ;;
+    --comments)
+      [[ "${2:-}" =~ ^([1-9][0-9]*|all)$ ]] || { echo -e "${RED}✗ --comments attend un nombre ou « all »${NC}"; usage; }
+      MAX_COMMENTS="$2"; FORCE_COMMENTS=yes; shift ;;
+    -h|--help)   usage ;;
+    -*)          echo -e "${RED}✗ Option inconnue : $1${NC}"; usage ;;
+    *)           URL="$1" ;;
   esac
   shift
 done
 [[ -z "$URL" ]] && usage
+if [[ -n "$TRACKLIST_FILE" && ! -r "$TRACKLIST_FILE" ]]; then
+  echo -e "${RED}✗ Fichier de tracklist illisible : ${TRACKLIST_FILE}${NC}"
+  exit 1
+fi
 
 check_deps
 
@@ -218,38 +387,63 @@ YT_ARTIST=$(yt-dlp --no-playlist --print "%(artist)s" "$URL" 2>/dev/null || true
 [[ -z "$YT_ARTIST" || "$YT_ARTIST" == "NA" ]] && \
   YT_ARTIST=$(yt-dlp --no-playlist --print "%(uploader)s" "$URL" 2>/dev/null || true)
 
-# ── Détection des pistes : chapitres, sinon tracklist de la description ──────
+# ── Détection des pistes ──────────────────────────────────────────────────────
+# Ordre : --tracklist, chapitres, description, commentaires, saisie manuelle (--split)
+COMMENTS_MIN_DURATION=480   # on ne fouille les commentaires que pour les vidéos ≥ 8 min
 SPLIT=no
 if [[ "$SPLIT_MODE" != no ]]; then
-  MARK='@@YTDL_MUSIC@@'
-  INFO=$(yt-dlp --no-playlist \
-    --print '%(chapters.:.start_time)#l' --print "$MARK" \
-    --print '%(chapters.:.title)#l' --print "$MARK" \
-    --print '%(description)s' "$URL" 2>/dev/null || true)
-
-  if [[ "$INFO" == *"$MARK"*"$MARK"* ]]; then
-    CH_STARTS=${INFO%%"$MARK"*}
-    REST=${INFO#*"$MARK"$'\n'}
-    CH_TITLES=${REST%%"$MARK"*}
-    DESCRIPTION=${REST#*"$MARK"$'\n'}
-  else
-    CH_STARTS=""; CH_TITLES=""; DESCRIPTION=""
-  fi
-
   SOURCE=""
   T_START_MS=(); T_TITLE=()
-  mapfile -t _starts <<< "$CH_STARTS"
-  mapfile -t _titles <<< "$CH_TITLES"
-  for i in "${!_starts[@]}"; do
-    ms=$(sec_to_ms "${_starts[i]}") || continue
-    T_START_MS+=("$ms")
-    T_TITLE+=("${_titles[i]:-Piste $(( i + 1 ))}")
-  done
-  if validate_tracks; then
-    SOURCE="chapitres YouTube"
-  elif [[ -n "$DESCRIPTION" && "$DESCRIPTION" != "NA" ]]; then
-    parse_description "$DESCRIPTION"
-    validate_tracks && SOURCE="tracklist de la description"
+
+  if [[ -n "$TRACKLIST_FILE" ]]; then
+    parse_description "$(cat "$TRACKLIST_FILE")"
+    if ! validate_tracks; then
+      echo -e "${RED}✗ Tracklist invalide dans ${TRACKLIST_FILE} (au moins 2 pistes, la première à 0:00, horodatages croissants).${NC}"
+      exit 1
+    fi
+    SOURCE="fichier ${TRACKLIST_FILE}"
+  else
+    yt_parts -- '%(chapters.:.start_time)#l' '%(chapters.:.title)#l' '%(description)s' '%(duration)s'
+    CH_STARTS=${PARTS[0]:-}; CH_TITLES=${PARTS[1]:-}; DESCRIPTION=${PARTS[2]:-}
+    VIDEO_DURATION=${PARTS[3]:-}; VIDEO_DURATION=${VIDEO_DURATION%%.*}
+    [[ "$VIDEO_DURATION" =~ ^[0-9]+$ ]] || VIDEO_DURATION=0
+
+    mapfile -t _starts <<< "$CH_STARTS"
+    mapfile -t _titles <<< "$CH_TITLES"
+    for i in "${!_starts[@]}"; do
+      ms=$(sec_to_ms "${_starts[i]}") || continue
+      T_START_MS+=("$ms")
+      T_TITLE+=("${_titles[i]:-Piste $(( i + 1 ))}")
+    done
+    if validate_tracks; then
+      SOURCE="chapitres YouTube"
+    elif [[ -n "$DESCRIPTION" && "$DESCRIPTION" != "NA" ]]; then
+      parse_description "$DESCRIPTION"
+      validate_tracks && SOURCE="tracklist de la description"
+    fi
+
+    if [[ -z "$SOURCE" ]] && { [[ "$SPLIT_MODE" == yes || "$FORCE_COMMENTS" == yes ]] || (( VIDEO_DURATION >= COMMENTS_MIN_DURATION )); }; then
+      if [[ "$MAX_COMMENTS" == all ]]; then
+        echo -e "${CYAN}▶ Recherche d'une tracklist dans tous les commentaires (peut prendre 1 à 2 min)…${NC}"
+      else
+        echo -e "${CYAN}▶ Recherche d'une tracklist dans les ${MAX_COMMENTS} premiers commentaires…${NC}"
+      fi
+      find_in_comments && SOURCE="commentaire de ${COMMENT_AUTHOR}"
+    fi
+
+    if [[ -z "$SOURCE" && "$SPLIT_MODE" == yes ]]; then
+      echo -e "${YELLOW}  Aucun chapitre ni tracklist trouvé (description, commentaires).${NC}"
+      read -rp "$(echo -e "${GREEN}✍  Coller une tracklist ? [o/N] : ${NC}")" ANSWER || true
+      if [[ "$ANSWER" =~ ^[oOyY] ]]; then
+        read_pasted_tracklist
+        parse_description "$PASTED"
+        if validate_tracks; then
+          SOURCE="tracklist saisie"
+        else
+          echo -e "${YELLOW}  Tracklist invalide (au moins 2 pistes, la première à 0:00, horodatages croissants).${NC}"
+        fi
+      fi
+    fi
   fi
 
   if [[ -n "$SOURCE" ]]; then
@@ -268,6 +462,9 @@ if [[ "$SPLIT_MODE" != no ]]; then
     fi
   elif [[ "$SPLIT_MODE" == yes ]]; then
     echo -e "${YELLOW}  Aucun chapitre ni tracklist exploitable : un seul fichier.${NC}"
+  elif (( ${VIDEO_DURATION:-0} >= COMMENTS_MIN_DURATION )); then
+    echo -e "${YELLOW}  Aucune tracklist trouvée. Pour découper quand même : --comments all (fouiller tous les commentaires),${NC}"
+    echo -e "${YELLOW}  --split (saisie manuelle) ou --tracklist fichier.txt${NC}"
   fi
 fi
 

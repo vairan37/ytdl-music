@@ -60,26 +60,31 @@ sudo mv ytdl-music.sh /usr/local/bin/ytdl-music
 ## Utilisation
 
 ```bash
-ytdl-music [--split | --no-split] <URL>
+ytdl-music [--split | --no-split | --tracklist FICHIER] [--comments N|all] "<URL>"
 ```
+
+> ⚠️ **Mets toujours l'URL entre guillemets.** Une URL YouTube contient souvent des `&` (`…&list=…&t=…`) : sans guillemets, bash coupe la commande à chaque `&` et lance le script en arrière-plan avec une URL tronquée.
 
 | Option | Effet |
 |---|---|
 | *(aucune)* | Si des pistes sont détectées, affiche la tracklist et demande `Découper en N pistes ? [O/n]` |
-| `--split` | Découpe sans demander (si des pistes sont détectées, sinon un seul fichier) |
+| `--split` | Découpe sans demander. Si rien n'est détecté, propose de **coller une tracklist** au clavier |
 | `--no-split` | Ne cherche pas de pistes : toujours un seul fichier (comportement historique) |
+| `--tracklist FICHIER` | Découpe selon la tracklist du fichier (une ligne `00:00 Titre` par piste), sans rien chercher en ligne |
+| `--comments N` | Cherche une tracklist dans les N commentaires les plus populaires (50 par défaut), quelle que soit la durée de la vidéo |
+| `--comments all` | Lit **tous** les commentaires : retrouve une tracklist postée par un fan même peu likée (≈ 1 min pour 4 000 commentaires) |
 
 ### Exemples
 
 ```bash
 # YouTube
-ytdl-music https://www.youtube.com/watch?v=xxxxx
+ytdl-music "https://www.youtube.com/watch?v=xxxxx"
 
 # SoundCloud
-ytdl-music https://soundcloud.com/artiste/titre
+ytdl-music "https://soundcloud.com/artiste/titre"
 
 # Bandcamp, Vimeo, Twitter, et +1000 autres sites supportés par yt-dlp...
-ytdl-music https://bandcamp.com/...
+ytdl-music "https://bandcamp.com/..."
 ```
 
 ### Déroulement
@@ -107,10 +112,37 @@ ytdl-music https://bandcamp.com/...
 
 ## Découpage en pistes (albums, mixes, compilations)
 
-Quand une vidéo contient plusieurs morceaux, le script peut la découper en un MP3 par piste. Les pistes sont détectées :
+Quand une vidéo contient plusieurs morceaux, le script peut la découper en un MP3 par piste. Les pistes sont cherchées dans cet ordre :
 
-1. depuis les **chapitres YouTube** s'il y en a ;
-2. sinon depuis une **tracklist horodatée dans la description**.
+1. les **chapitres YouTube** ;
+2. une **tracklist horodatée dans la description** ;
+3. une **tracklist postée en commentaire** : parmi les 50 commentaires les plus populaires (ou plus avec `--comments`), le script garde celui qui donne la tracklist valide la plus longue ; à égalité, le plus populaire. Son auteur est affiché. Cette recherche prend quelques secondes, elle n'est donc faite que pour les vidéos de **8 min ou plus**, ou avec `--split` / `--comments` ;
+4. avec `--split`, si rien n'a été trouvé : **saisie manuelle**. Colle la tracklist (une piste par ligne) et termine par une ligne vide.
+
+### Vidéos sans chapitres ni tracklist (freestyles, sessions type Grünt…)
+
+Ces vidéos s'enchaînent sans blanc entre les morceaux : impossible de les découper automatiquement à partir du son. Il faut donc des horodatages venus d'ailleurs :
+
+```bash
+# Le script fouille les 50 commentaires les plus populaires
+ytdl-music "<URL>"
+
+# Tracklist postée plus bas dans les commentaires : on les lit tous (~1 min)
+ytdl-music --comments all "<URL>"
+
+# Rien en commentaire : --split propose de coller la tracklist
+ytdl-music --split "<URL>"
+
+# Ou tracklist préparée dans un fichier
+cat > grunt.txt <<'EOF'
+0:00 Rappeur A
+4:10 Rappeur B
+9:30 Rappeur C
+EOF
+ytdl-music --tracklist grunt.txt "<URL>"
+```
+
+Exemple réel : sur un Grünt de 28 min à ~6 000 commentaires, la tracklist d'un fan n'arrivait qu'autour de la 370ᵉ place. `--comments all` l'a trouvée en ~1 min, téléchargement et découpage compris.
 
 L'audio n'est téléchargé qu'une fois, puis découpé avec ffmpeg (copie directe sans ré-encodage, ou ré-encodage MP3 qualité max si la copie échoue). La dernière piste va jusqu'à la fin de l'audio.
 
@@ -123,6 +155,7 @@ L'audio n'est téléchargé qu'une fois, puis découpé avec ffmpeg (copie direc
 4. 1:02:15 Quatrième morceau     ← h:mm:ss, numérotation « 4. » ou « 4) » devant
 Cinquième morceau - 1:10:00      ← horodatage en fin de ligne
 00:00 - 03:42 Intro              ← plage : seul le début compte
+0:00 A 3:12 B 6:40 C             ← plusieurs pistes sur une ligne (fréquent en commentaire)
 ```
 
 Sont ignorés : les lignes contenant un lien, les lignes de hashtags, un horodatage seul sur sa ligne et un horodatage au milieu d'une phrase (« enregistré à 21:30 à Paris »).
@@ -168,7 +201,10 @@ Si des titres sont au format `Artiste - Titre` (compilations, mixes de DJ), le s
 - Les horodatages des descriptions sont à la seconde près, et parfois approximatifs : les coupures héritent de ces imprécisions.
 - En copie directe, la coupure se fait à la trame MP3 près (~26 ms).
 - Si la tracklist dépasse la durée réelle de l'audio, le script abandonne le découpage et crée un seul fichier.
-- Seule la description de la vidéo est lue, pas les commentaires (où se trouvent parfois les tracklists).
+- Les commentaires ne sont lus que sur YouTube, triés par popularité, **sans les réponses** : une tracklist postée en réponse à un autre commentaire n'est pas vue, même avec `--comments all`. Dans ce cas, utilise `--split` ou `--tracklist`.
+- `--comments all` dépend de la taille de la vidéo : environ 1 min pour quelques milliers de commentaires, beaucoup plus pour une vidéo très populaire.
+- Plusieurs pistes sur une seule ligne ne sont reconnues que si la ligne commence par un horodatage (`0:00 A 3:12 B`), pas au format `A 0:00 B 3:12`.
+- Pour la saisie manuelle, la tracklist se termine à la première ligne vide : retire les lignes vides au milieu avant de coller.
 
 ---
 
